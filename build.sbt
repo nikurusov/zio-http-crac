@@ -184,6 +184,7 @@ lazy val zioHttp = crossProject(JSPlatform, JVMPlatform)
       `zio-test`,
       `zio-test-sbt`,
       `scala-compat-collection`,
+      "org.crac" % "crac" % "1.5.0",
     ) ++ netty ++ Seq(`netty-incubator`),
   )
   .jvmSettings(MimaSettings.mimaSettings(failOnProblem = true))

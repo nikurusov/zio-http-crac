@@ -29,6 +29,11 @@ import zio.http.{ClientDriver, Driver, Response, Routes, Server}
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel._
 import io.netty.util.ResourceLeakDetector
+import org.crac.Resource
+import org.crac.Context
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.LongAdder
+import org.crac.Core
 
 private[zio] final case class NettyDriver(
   appRef: RoutesRef,
@@ -38,7 +43,13 @@ private[zio] final case class NettyDriver(
   eventLoopGroups: ServerEventLoopGroups,
   serverConfig: Server.Config,
   nettyConfig: NettyConfig,
-) extends Driver { self =>
+) extends Driver
+    with Resource { self =>
+
+  Core.getGlobalContext().register(this)
+
+  private val channelVar = new AtomicReference[Channel](null)
+  private val scopeVar   = new AtomicReference[zio.Scope](null)
 
   def start(implicit trace: Trace): RIO[Scope, StartResult] =
     for {
@@ -51,10 +62,17 @@ private[zio] final case class NettyDriver(
           .childOption[JBoolean](ChannelOption.TCP_NODELAY, serverConfig.tcpNoDelay)
           .bind(serverConfig.address)
       }
+      // how to play around that
+      // https://netty.io/wiki/user-guide-for-4.x.html#shutting-down-your-application
       _       <- NettyFutureExecutor.scoped(chf)
       _       <- ZIO.succeed(ResourceLeakDetector.setLevel(nettyConfig.leakDetectionLevel.toNetty))
       channel <- ZIO.attempt(chf.channel())
-      port    <- ZIO.attempt(channel.localAddress().asInstanceOf[InetSocketAddress].getPort)
+
+      thisScope <- ZIO.scope
+      _ = scopeVar.set(thisScope)
+      _ = channelVar.set(channel)
+
+      port <- ZIO.attempt(channel.localAddress().asInstanceOf[InetSocketAddress].getPort)
 
       _ <- Scope.addFinalizer(
         NettyFutureExecutor.executed(channel.close()).ignoreLogged,
@@ -85,6 +103,59 @@ private[zio] final case class NettyDriver(
         .provideSomeEnvironment[Scope](_ ++ ZEnvironment[ChannelType.Config](nettyConfig))
       nettyRuntime   <- NettyRuntime.live.build
     } yield NettyClientDriver(channelFactory.get, eventLoopGroups.worker, nettyRuntime.get)
+
+  override def beforeCheckpoint(context: Context[_ <: Resource]): Unit = {
+    val channel = channelVar.get()
+    if (channel != null) {
+      channel.close().awaitUninterruptibly()
+      eventLoopGroups.worker.shutdownGracefully().awaitUninterruptibly()
+      eventLoopGroups.boss.shutdownGracefully().awaitUninterruptibly()
+    }
+    ()
+  }
+
+  override def afterRestore(context: Context[_ <: Resource]): Unit = {
+    // 1. make event loops
+    // 2. set ref on this eventloop
+    // 3. when scope is closed, this loop will be closed
+
+    val appScope = Option(scopeVar.get()).getOrElse(throw new RuntimeException("App scope is null"))
+
+    val bossEventLoopZIO =
+      (ZLayer.succeed(nettyConfig.bossGroup) >+> EventLoopGroups.live).build
+        .map(e => e.get[EventLoopGroup])
+
+    val workerEventLoopZIO =
+      (ZLayer.succeed(nettyConfig.bossGroup) >+> EventLoopGroups.live).build
+        .map(e => e.get[EventLoopGroup])
+
+    val newServer = for {
+      bossEL   <- bossEventLoopZIO
+      workerEL <- workerEventLoopZIO
+      chf      <- ZIO.attempt {
+        new ServerBootstrap()
+          .group(bossEL, workerEL)
+          .channelFactory(channelFactory)
+          .childHandler(channelInitializer)
+          .option[Integer](ChannelOption.SO_BACKLOG, serverConfig.soBacklog)
+          .childOption[JBoolean](ChannelOption.TCP_NODELAY, serverConfig.tcpNoDelay)
+          .bind(serverConfig.address)
+      }
+      _        <- NettyFutureExecutor.scoped(chf)
+      _        <- ZIO.succeed(ResourceLeakDetector.setLevel(nettyConfig.leakDetectionLevel.toNetty))
+      channel  <- ZIO.attempt(chf.channel())
+
+      _ <- Scope.addFinalizer(
+        NettyFutureExecutor.executed(channel.close()).ignoreLogged,
+      )
+    } yield ()
+
+    zio.Unsafe.unsafe { implicit u =>
+      zio.Runtime.default.unsafe.run(newServer.provide(ZLayer.succeed(appScope)))
+    }
+
+    ()
+  }
 
   override def toString: String = s"NettyDriver($serverConfig)"
 }
