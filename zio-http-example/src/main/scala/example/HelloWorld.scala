@@ -1,8 +1,8 @@
 package example
 
 import zio._
-
 import zio.http._
+import zio.http.netty.{ChannelType, NettyConfig}
 
 object HelloWorld extends ZIOAppDefault {
   // Responds with plain text
@@ -14,10 +14,17 @@ object HelloWorld extends ZIOAppDefault {
     Method.GET / "json" -> handler(Response.json("""{"greetings": "Hello World!"}"""))
 
   // Create HTTP route
-  val app          = Routes(homeRoute, jsonRoute)
-    .tapErrorCauseZIO(err => zio.Console.printLine(err.squash).orDie) @@ Middleware.debug
-  val serverConfig = Server.defaultWith(_.binding("localhost", 8080))
+  val app = Routes(homeRoute, jsonRoute)
 
-  // Run it like any simple app
-  override val run = Server.serve(app).provide(serverConfig)
+  val run = {
+    val config           = Server.Config.default
+      .port(8080)
+    val nettyConfig      = NettyConfig.default.channelType(ChannelType.EPOLL)
+    val configLayer      = ZLayer.succeed(config)
+    val nettyConfigLayer = ZLayer.succeed(nettyConfig)
+
+    app
+      .serve[Any]
+      .provide(configLayer, nettyConfigLayer, Server.customized)
+  }
 }

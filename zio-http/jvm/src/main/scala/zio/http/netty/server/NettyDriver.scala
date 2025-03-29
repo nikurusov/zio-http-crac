@@ -18,24 +18,24 @@ package zio.http.netty.server
 
 import java.lang.{Boolean => JBoolean}
 import java.net.InetSocketAddress
-
 import zio._
-
 import zio.http.Driver.StartResult
 import zio.http.netty._
 import zio.http.netty.client.NettyClientDriver
 import zio.http.{ClientDriver, Driver, Response, Routes, Server}
-
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel._
+import io.netty.channel.epoll.EpollEventLoop
 import io.netty.util.ResourceLeakDetector
 import org.crac.Resource
 import org.crac.Context
+
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.atomic.LongAdder
 import org.crac.Core
 
-private[zio] final case class NettyDriver(
+import scala.util.{Failure, Success, Try}
+
+final case class NettyDriver(
   appRef: RoutesRef,
   channelFactory: ChannelFactory[ServerChannel],
   channelInitializer: ChannelInitializer[Channel],
@@ -46,14 +46,13 @@ private[zio] final case class NettyDriver(
 ) extends Driver
     with Resource { self =>
 
-  Core.getGlobalContext().register(this)
-
-  private val channelVar = new AtomicReference[Channel](null)
-  private val scopeVar   = new AtomicReference[zio.Scope](null)
+  private val closeListeners = scala.collection.mutable.ListBuffer.empty[() => ChannelFuture]
+  private val scopeUnsafe    = new AtomicReference[zio.Scope](null)
 
   def start(implicit trace: Trace): RIO[Scope, StartResult] =
     for {
-      chf     <- ZIO.attempt {
+      _   <- ZIO.attempt(Core.getGlobalContext().register(this))
+      chf <- ZIO.attempt {
         new ServerBootstrap()
           .group(eventLoopGroups.boss, eventLoopGroups.worker)
           .channelFactory(channelFactory)
@@ -62,15 +61,16 @@ private[zio] final case class NettyDriver(
           .childOption[JBoolean](ChannelOption.TCP_NODELAY, serverConfig.tcpNoDelay)
           .bind(serverConfig.address)
       }
-      // how to play around that
-      // https://netty.io/wiki/user-guide-for-4.x.html#shutting-down-your-application
+
       _       <- NettyFutureExecutor.scoped(chf)
       _       <- ZIO.succeed(ResourceLeakDetector.setLevel(nettyConfig.leakDetectionLevel.toNetty))
       channel <- ZIO.attempt(chf.channel())
 
       thisScope <- ZIO.scope
-      _ = scopeVar.set(thisScope)
-      _ = channelVar.set(channel)
+      _            = scopeUnsafe.set(thisScope)
+      closeChannel = () => channel.close
+      closeChf     = () => { chf.cancel(true); chf }
+      _            = closeListeners.addAll(List(closeChf, closeChannel))
 
       port <- ZIO.attempt(channel.localAddress().asInstanceOf[InetSocketAddress].getPort)
 
@@ -105,21 +105,33 @@ private[zio] final case class NettyDriver(
     } yield NettyClientDriver(channelFactory.get, eventLoopGroups.worker, nettyRuntime.get)
 
   override def beforeCheckpoint(context: Context[_ <: Resource]): Unit = {
-    val channel = channelVar.get()
-    if (channel != null) {
-      channel.close().awaitUninterruptibly()
-      eventLoopGroups.worker.shutdownGracefully().awaitUninterruptibly()
-      eventLoopGroups.boss.shutdownGracefully().awaitUninterruptibly()
+    def closeFileDescriptorsForEpoll(eventLoopGroup: EventLoopGroup) = {
+      val it = eventLoopGroup.iterator()
+      while (it.hasNext) {
+        val eventExecutor = it.next()
+        val eventLoop     = Try(eventExecutor.asInstanceOf[EventLoop])
+
+        eventLoop match {
+          case Failure(exception) =>
+            throw new RuntimeException("Unexpected exception in beforeCheckpoint", exception)
+          case Success(ev)        =>
+            ev match {
+              case epoll: EpollEventLoop => epoll.closeFileDescriptors()
+              case _                     => throw new RuntimeException("Expected epoll")
+            }
+        }
+      }
     }
-    ()
+
+    eventLoopGroups.boss.shutdownGracefully().awaitUninterruptibly()
+    eventLoopGroups.worker.shutdownGracefully().awaitUninterruptibly()
+    closeListeners.foreach(fut => fut().awaitUninterruptibly())
+    closeFileDescriptorsForEpoll(eventLoopGroups.boss)
+    closeFileDescriptorsForEpoll(eventLoopGroups.worker)
   }
 
   override def afterRestore(context: Context[_ <: Resource]): Unit = {
-    // 1. make event loops
-    // 2. set ref on this eventloop
-    // 3. when scope is closed, this loop will be closed
-
-    val appScope = Option(scopeVar.get()).getOrElse(throw new RuntimeException("App scope is null"))
+    val appScope = Option(scopeUnsafe.get()).getOrElse(throw new RuntimeException("App scope is null"))
 
     val bossEventLoopZIO =
       (ZLayer.succeed(nettyConfig.bossGroup) >+> EventLoopGroups.live).build
