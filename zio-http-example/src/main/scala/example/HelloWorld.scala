@@ -19,7 +19,7 @@ object HelloWorld extends ZIOAppDefault {
   val run = {
     val config           = Server.Config.default
       .port(8080)
-    val nettyConfig      = NettyConfig.default.channelType(ChannelType.EPOLL)
+    val nettyConfig      = NettyConfig.default
     val configLayer      = ZLayer.succeed(config)
     val nettyConfigLayer = ZLayer.succeed(nettyConfig)
 

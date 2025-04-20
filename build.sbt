@@ -186,6 +186,10 @@ lazy val zioHttp = crossProject(JSPlatform, JVMPlatform)
       `scala-compat-collection`,
       "org.crac" % "crac" % "1.5.0",
     ) ++ netty ++ Seq(`netty-incubator`),
+    assembly / assemblyMergeStrategy := {
+      case x @ PathList("META-INF", _*) => MergeStrategy.discard
+      case x                            => MergeStrategy.first
+    },
   )
   .jvmSettings(MimaSettings.mimaSettings(failOnProblem = true))
   .jsSettings(
@@ -311,24 +315,6 @@ lazy val zioHttpExample = (project in file("zio-http-example"))
     ),
   )
   .dependsOn(zioHttpJVM, zioHttpCli, zioHttpGen)
-
-lazy val cracTest = (project in file("crac-test"))
-  .settings(stdSettings("crac-test"))
-  .settings(publishSetting(false))
-  .settings(libraryDependencies ++= Seq(`jwt-core`, `zio-schema-json`))
-  .settings(
-    run / fork      := true,
-    run / javaOptions ++= Seq("-Xms4G", "-Xmx4G", "-XX:+UseG1GC"),
-    run / mainClass := Some("HelloWorld"),
-    libraryDependencies ++= Seq(
-      `zio-config`,
-      `zio-config-magnolia`,
-      `zio-config-typesafe`,
-      "dev.zio" %% "zio-metrics-connectors"            % "2.3.1",
-      "dev.zio" %% "zio-metrics-connectors-prometheus" % "2.3.1",
-    ),
-  )
-  .dependsOn(zioHttpJVM)
 
 lazy val zioHttpTools = (project in file("zio-http-tools"))
   .settings(stdSettings("zio-http-tools"))

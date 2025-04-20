@@ -46,11 +46,14 @@ final case class NettyDriver(
 ) extends Driver
     with Resource { self =>
 
-  private val closeListeners = scala.collection.mutable.ListBuffer.empty[() => ChannelFuture]
-  private val scopeUnsafe    = new AtomicReference[zio.Scope](null)
+  private val activeListenersCloseHooks = scala.collection.mutable.ListBuffer.empty[() => ChannelFuture]
+  private val scopeRef                  = new AtomicReference[zio.Scope](null)
 
   def start(implicit trace: Trace): RIO[Scope, StartResult] =
     for {
+      thisScope <- ZIO.scope
+      _ = scopeRef.set(thisScope)
+
       _   <- ZIO.attempt(Core.getGlobalContext().register(this))
       chf <- ZIO.attempt {
         new ServerBootstrap()
@@ -66,11 +69,9 @@ final case class NettyDriver(
       _       <- ZIO.succeed(ResourceLeakDetector.setLevel(nettyConfig.leakDetectionLevel.toNetty))
       channel <- ZIO.attempt(chf.channel())
 
-      thisScope <- ZIO.scope
-      _            = scopeUnsafe.set(thisScope)
-      closeChannel = () => channel.close
-      closeChf     = () => { chf.cancel(true); chf }
-      _            = closeListeners.addAll(List(closeChf, closeChannel))
+      _ = activeListenersCloseHooks.addAll(
+        List(() => { chf.cancel(true); chf.await() }, () => channel.close()),
+      )
 
       port <- ZIO.attempt(channel.localAddress().asInstanceOf[InetSocketAddress].getPort)
 
@@ -104,34 +105,19 @@ final case class NettyDriver(
       nettyRuntime   <- NettyRuntime.live.build
     } yield NettyClientDriver(channelFactory.get, eventLoopGroups.worker, nettyRuntime.get)
 
+  override def toString: String = s"NettyDriver($serverConfig)"
+
+  // CRaC support
   override def beforeCheckpoint(context: Context[_ <: Resource]): Unit = {
-    def closeFileDescriptorsForEpoll(eventLoopGroup: EventLoopGroup) = {
-      val it = eventLoopGroup.iterator()
-      while (it.hasNext) {
-        val eventExecutor = it.next()
-        val eventLoop     = Try(eventExecutor.asInstanceOf[EventLoop])
-
-        eventLoop match {
-          case Failure(exception) =>
-            throw new RuntimeException("Unexpected exception in beforeCheckpoint", exception)
-          case Success(ev)        =>
-            ev match {
-              case epoll: EpollEventLoop => epoll.closeFileDescriptors()
-              case _                     => throw new RuntimeException("Expected epoll")
-            }
-        }
-      }
-    }
-
     eventLoopGroups.boss.shutdownGracefully().awaitUninterruptibly()
     eventLoopGroups.worker.shutdownGracefully().awaitUninterruptibly()
-    closeListeners.foreach(fut => fut().awaitUninterruptibly())
-    closeFileDescriptorsForEpoll(eventLoopGroups.boss)
-    closeFileDescriptorsForEpoll(eventLoopGroups.worker)
+    activeListenersCloseHooks.foreach(fut => fut().awaitUninterruptibly())
+    activeListenersCloseHooks.clear()
   }
 
   override def afterRestore(context: Context[_ <: Resource]): Unit = {
-    val appScope = Option(scopeUnsafe.get()).getOrElse(throw new RuntimeException("App scope is null"))
+    val appScope = Option(scopeRef.get())
+      .getOrElse(throw new RuntimeException("Scope is empty, can't restore app"))
 
     val bossEventLoopZIO =
       (ZLayer.succeed(nettyConfig.bossGroup) >+> EventLoopGroups.live).build
@@ -157,6 +143,9 @@ final case class NettyDriver(
       _        <- ZIO.succeed(ResourceLeakDetector.setLevel(nettyConfig.leakDetectionLevel.toNetty))
       channel  <- ZIO.attempt(chf.channel())
 
+      _ = activeListenersCloseHooks.addAll(
+        List(() => { chf.cancel(true); chf.await() }, () => channel.close()),
+      )
       _ <- Scope.addFinalizer(
         NettyFutureExecutor.executed(channel.close()).ignoreLogged,
       )
@@ -168,8 +157,6 @@ final case class NettyDriver(
 
     ()
   }
-
-  override def toString: String = s"NettyDriver($serverConfig)"
 }
 
 object NettyDriver {
