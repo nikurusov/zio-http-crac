@@ -299,13 +299,8 @@ lazy val zioHttpExample = (project in file("zio-http-example"))
   .settings(runSettings(Debug.Main))
   .settings(libraryDependencies ++= Seq(`jwt-core`, `zio-schema-json`))
   .settings(
-    run / fork                       := true,
+    run / fork := true,
     run / javaOptions ++= Seq("-Xms4G", "-Xmx4G", "-XX:+UseG1GC"),
-    assembly / assemblyMergeStrategy := {
-      case x @ PathList("META-INF", _*) => MergeStrategy.discard
-      case x                            => MergeStrategy.first
-    },
-    assembly / mainClass             := Some("example.HelloWorld"),
     libraryDependencies ++= Seq(
       `zio-config`,
       `zio-config-magnolia`,
