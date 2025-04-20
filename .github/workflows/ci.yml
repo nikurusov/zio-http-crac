@@ -1047,7 +1047,7 @@ jobs:
           echo "concurrency=$RESULT_CONCURRENCY" >> $GITHUB_OUTPUT
 
       - if: ${{github.event.pull_request.head.repo.full_name == 'zio/zio-http'}}
-        uses: peter-evans/commit-comment@v2
+        uses: peter-evans/commit-comment@v3
         with:
           sha: ${{github.event.pull_request.head.sha}}
           body: |
@@ -1126,7 +1126,7 @@ jobs:
           echo "concurrency=$RESULT_CONCURRENCY" >> $GITHUB_OUTPUT
 
       - if: ${{github.event.pull_request.head.repo.full_name == 'zio/zio-http'}}
-        uses: peter-evans/commit-comment@v2
+        uses: peter-evans/commit-comment@v3
         with:
           sha: ${{github.event.pull_request.head.sha}}
           body: |
